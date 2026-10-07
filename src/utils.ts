@@ -2800,17 +2800,9 @@ function sanitizeMessageForModelSwitch(
         return part.value.length > 0;
       }
 
-      if (
-        !(part instanceof vscode.LanguageModelDataPart) ||
-        !isImageMarker(part) ||
-        imageRetention === 'discard'
-      ) {
-        return false;
-      }
-
       return (
-        imageRetention === 'all' ||
-        message.role === vscode.LanguageModelChatMessageRole.User
+        isImageDataPart(part) &&
+        allowsImageParts(imageRetention, message.role)
       );
     },
   );
@@ -2823,6 +2815,48 @@ function sanitizeMessageForModelSwitch(
     role: message.role,
     name: message.name,
     content: portableParts,
+  };
+}
+
+function isImageDataPart(
+  part: unknown,
+): part is vscode.LanguageModelDataPart {
+  return part instanceof vscode.LanguageModelDataPart && isImageMarker(part);
+}
+
+function allowsImageParts(
+  imageRetention: SanitizedImagePartRetention,
+  role: vscode.LanguageModelChatMessageRole,
+): boolean {
+  return (
+    imageRetention === 'all' ||
+    (imageRetention === 'user-only' &&
+      role === vscode.LanguageModelChatMessageRole.User)
+  );
+}
+
+function stripDisallowedImages(
+  message: vscode.LanguageModelChatRequestMessage,
+  imageRetention: SanitizedImagePartRetention,
+): vscode.LanguageModelChatRequestMessage | undefined {
+  if (allowsImageParts(imageRetention, message.role)) {
+    return message;
+  }
+
+  const retainedParts = message.content.filter(
+    (part) => !isImageDataPart(part),
+  );
+  if (retainedParts.length === message.content.length) {
+    return message;
+  }
+  if (retainedParts.length === 0) {
+    return undefined;
+  }
+
+  return {
+    role: message.role,
+    name: message.name,
+    content: retainedParts,
   };
 }
 
@@ -2887,13 +2921,17 @@ export function sanitizeMessagesForModelSwitchDetailed(
   },
 ): SanitizedMessagesForModelSwitchResult {
   const sanitizedMessageIndexes = new Set<number>();
+  const replayedRoundMessageIndexes = new Set<number>();
+  const imageRetention = options.imageRetention ?? 'discard';
 
   let round: number[] = [];
   let roundHasAssistant = false;
+  let roundMarkerDecoded = false;
 
   const flush = (): void => {
     if (round.length === 0) {
       roundHasAssistant = false;
+      roundMarkerDecoded = false;
       return;
     }
 
@@ -2905,37 +2943,49 @@ export function sanitizeMessagesForModelSwitchDetailed(
           continue;
         }
 
+        // Markers can be lost across tool continuations in agent host BYOK
+        // sessions. A round with no marker is treated as this model's own
+        // history and replayed best-effort. Only a marker that is present
+        // but fails the identity check invalidates the round.
         const markerParts = message.content.filter(
           (part): part is vscode.LanguageModelDataPart =>
             part instanceof vscode.LanguageModelDataPart &&
             part.mimeType === DataPartMimeTypes.StatefulMarker,
         );
+        const [markerPart] = markerParts;
+        if (!markerPart) {
+          continue;
+        }
 
-        if (markerParts.length !== 1) {
+        if (
+          markerParts.length > 1 ||
+          !tryDecodeStatefulMarkerPart<object>(
+            options.expectedIdentity,
+            options.modelId,
+            markerPart,
+          )
+        ) {
           isRoundValid = false;
           break;
         }
 
-        const decoded = tryDecodeStatefulMarkerPart<object>(
-          options.expectedIdentity,
-          options.modelId,
-          markerParts[0],
-        );
-        if (!decoded) {
-          isRoundValid = false;
-          break;
-        }
+        roundMarkerDecoded = true;
       }
 
       if (!isRoundValid) {
         for (const index of round) {
           sanitizedMessageIndexes.add(index);
         }
+      } else if (!roundMarkerDecoded) {
+        for (const index of round) {
+          replayedRoundMessageIndexes.add(index);
+        }
       }
     }
 
     round = [];
     roundHasAssistant = false;
+    roundMarkerDecoded = false;
   };
 
   for (const [index, message] of messages.entries()) {
@@ -2970,14 +3020,21 @@ export function sanitizeMessagesForModelSwitchDetailed(
   const messageOriginIndexes: number[] = [];
   for (const [index, message] of messages.entries()) {
     if (!sanitizedMessageIndexes.has(index)) {
-      out.push(message);
-      messageOriginIndexes.push(index);
+      // Replayed rounds keep their tool structure but share the image
+      // retention policy with sanitized rounds.
+      const keptMessage = replayedRoundMessageIndexes.has(index)
+        ? stripDisallowedImages(message, imageRetention)
+        : message;
+      if (keptMessage) {
+        out.push(keptMessage);
+        messageOriginIndexes.push(index);
+      }
       continue;
     }
 
     const sanitizedMessage = sanitizeMessageForModelSwitch(
       message,
-      options.imageRetention ?? 'discard',
+      imageRetention,
     );
     if (sanitizedMessage) {
       out.push(sanitizedMessage);

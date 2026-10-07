@@ -46,18 +46,43 @@ vi.mock('../../src/official-models-manager', () => ({
 }));
 
 import * as vscode from 'vscode';
-import { sanitizeMessagesForModelSwitchDetailed } from '../../src/utils';
+import {
+  sanitizeMessagesForModelSwitchDetailed,
+  type SanitizedImagePartRetention,
+} from '../../src/utils';
 
 const modelId = 'provider/target-model';
 const expectedIdentity = 'target-model-identity';
 
 function sanitize(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
+  imageRetention?: SanitizedImagePartRetention,
 ) {
   return sanitizeMessagesForModelSwitchDetailed(messages, {
     modelId,
     expectedIdentity,
+    imageRetention,
   });
+}
+
+function userMessage(
+  ...content: vscode.LanguageModelInputPart[]
+): vscode.LanguageModelChatRequestMessage {
+  return {
+    role: vscode.LanguageModelChatMessageRole.User,
+    name: undefined,
+    content,
+  };
+}
+
+function assistantMessage(
+  ...content: vscode.LanguageModelInputPart[]
+): vscode.LanguageModelChatRequestMessage {
+  return {
+    role: vscode.LanguageModelChatMessageRole.Assistant,
+    name: undefined,
+    content,
+  };
 }
 
 function textValues(
@@ -68,10 +93,10 @@ function textValues(
   );
 }
 
-function createTrustedMarker(): vscode.LanguageModelDataPart {
+function createMarker(identity: string): vscode.LanguageModelDataPart {
   const envelope = Buffer.from(
     JSON.stringify({
-      identity: expectedIdentity,
+      identity,
       data: { providerMessage: 'raw' },
     }),
   ).toString('base64');
@@ -81,50 +106,77 @@ function createTrustedMarker(): vscode.LanguageModelDataPart {
   );
 }
 
+function trustedMarker(): vscode.LanguageModelDataPart {
+  return createMarker(expectedIdentity);
+}
+
+function foreignMarker(): vscode.LanguageModelDataPart {
+  return createMarker('other-model-identity');
+}
+
+function textPart(value: string): vscode.LanguageModelTextPart {
+  return new vscode.LanguageModelTextPart(value);
+}
+
+function imagePart(): vscode.LanguageModelDataPart {
+  return new vscode.LanguageModelDataPart(
+    Buffer.from('image-bytes'),
+    'image/png',
+  );
+}
+
 describe('model-switch message sanitization', () => {
-  it('keeps portable text from a sanitized assistant message without tools', () => {
+  it('keeps a marker-less assistant message without tools intact', () => {
     const result = sanitize([
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('question')],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('answer')],
-      },
+      userMessage(textPart('question')),
+      assistantMessage(textPart('answer')),
     ]);
 
     expect(result.messages).toHaveLength(2);
+    expect(result.messages[1].role).toBe(
+      vscode.LanguageModelChatMessageRole.Assistant,
+    );
     expect(textValues(result.messages[1])).toEqual(['answer']);
-    expect(result.sanitizedMessageIndexes).toEqual(new Set([0, 1]));
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
   });
 
-  it('drops assistant text together with a sanitized tool call and its result', () => {
+  it('keeps a marker-less tool exchange intact', () => {
     const result = sanitize([
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('question')],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelTextPart('I will inspect that.'),
-          new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
-        ],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelToolResultPart('call-1', [
-            new vscode.LanguageModelTextPart('result'),
-          ]),
-        ],
-      },
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('I will inspect that.'),
+        new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
+      ),
+      userMessage(
+        new vscode.LanguageModelToolResultPart('call-1', [textPart('result')]),
+      ),
+    ]);
+
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[1].role).toBe(
+      vscode.LanguageModelChatMessageRole.Assistant,
+    );
+    expect(result.messages[2].role).toBe(
+      vscode.LanguageModelChatMessageRole.User,
+    );
+    expect(result.messageOriginIndexes).toEqual([0, 1, 2]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
+  });
+
+  it('drops assistant text together with a tool call that carries a foreign marker', () => {
+    const result = sanitize([
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('I will inspect that.'),
+        new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
+        foreignMarker(),
+      ),
+      userMessage(
+        new vscode.LanguageModelToolResultPart('call-1', [
+          textPart('result'),
+        ]),
+      ),
     ]);
 
     expect(result.messages).toHaveLength(1);
@@ -137,31 +189,18 @@ describe('model-switch message sanitization', () => {
   });
 
   it('keeps an intact tool exchange produced by the target model', () => {
-    const marker = createTrustedMarker();
     const messages: vscode.LanguageModelChatRequestMessage[] = [
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('question')],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelTextPart('I will inspect that.'),
-          new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
-          marker,
-        ],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelToolResultPart('call-1', [
-            new vscode.LanguageModelTextPart('result'),
-          ]),
-        ],
-      },
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('I will inspect that.'),
+        new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
+        trustedMarker(),
+      ),
+      userMessage(
+        new vscode.LanguageModelToolResultPart('call-1', [
+          textPart('result'),
+        ]),
+      ),
     ];
 
     const result = sanitize(messages);
@@ -171,37 +210,44 @@ describe('model-switch message sanitization', () => {
     expect(result.sanitizedMessageIndexes).toEqual(new Set());
   });
 
-  it('drops the originating assistant message when its tool result is sanitized later', () => {
-    const marker = createTrustedMarker();
+  it('drops the tool result when its originating assistant message is sanitized', () => {
     const result = sanitize([
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('question')],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelTextPart('I will inspect that.'),
-          new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
-          marker,
-        ],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.User,
-        name: undefined,
-        content: [
-          new vscode.LanguageModelToolResultPart('call-1', [
-            new vscode.LanguageModelTextPart('result'),
-          ]),
-        ],
-      },
-      {
-        role: vscode.LanguageModelChatMessageRole.Assistant,
-        name: undefined,
-        content: [new vscode.LanguageModelTextPart('final answer')],
-      },
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('I will inspect that.'),
+        new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
+        foreignMarker(),
+      ),
+      userMessage(
+        new vscode.LanguageModelToolResultPart('call-1', [textPart('result')]),
+      ),
+      assistantMessage(textPart('final answer')),
+    ]);
+
+    expect(result.messages).toHaveLength(2);
+    expect(textValues(result.messages[0])).toEqual(['question']);
+    expect(textValues(result.messages[1])).toEqual(['final answer']);
+    expect(result.messageOriginIndexes).toEqual([0, 3]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set([0, 1, 2]));
+  });
+
+  it('drops the originating assistant message when its tool result is sanitized later', () => {
+    const result = sanitize([
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('I will inspect that.'),
+        new vscode.LanguageModelToolCallPart('call-1', 'inspect', {}),
+        trustedMarker(),
+      ),
+      userMessage(
+        new vscode.LanguageModelToolResultPart('call-1', [
+          textPart('result'),
+        ]),
+      ),
+      assistantMessage(
+        textPart('final answer'),
+        foreignMarker(),
+      ),
     ]);
 
     expect(result.messages).toHaveLength(2);
@@ -209,5 +255,118 @@ describe('model-switch message sanitization', () => {
     expect(textValues(result.messages[1])).toEqual(['final answer']);
     expect(result.messageOriginIndexes).toEqual([0, 3]);
     expect(result.sanitizedMessageIndexes).toEqual(new Set([1, 2, 3]));
+  });
+
+  it('sanitizes a round whose assistant message carries multiple markers', () => {
+    const result = sanitize([
+      userMessage(textPart('question')),
+      assistantMessage(
+        textPart('answer'),
+        trustedMarker(),
+        trustedMarker(),
+      ),
+    ]);
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[1].role).toBe(
+      vscode.LanguageModelChatMessageRole.Assistant,
+    );
+    expect(textValues(result.messages[1])).toEqual(['answer']);
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set([0, 1]));
+  });
+
+  it('strips user images from a marker-less round when the target model cannot consume them', () => {
+    const result = sanitize(
+      [
+        userMessage(
+          textPart('question'),
+          imagePart(),
+        ),
+        assistantMessage(textPart('answer')),
+      ],
+      'discard',
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(textValues(result.messages[0])).toEqual(['question']);
+    expect(result.messages[0].content).toHaveLength(1);
+    expect(textValues(result.messages[1])).toEqual(['answer']);
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
+  });
+
+  it('keeps user images from a marker-less round for a vision capable model', () => {
+    const result = sanitize(
+      [
+        userMessage(
+          textPart('question'),
+          imagePart(),
+        ),
+        assistantMessage(textPart('answer')),
+      ],
+      'user-only',
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].content).toHaveLength(2);
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
+  });
+
+  it('strips assistant images from a marker-less round for user-only image retention', () => {
+    const result = sanitize(
+      [
+        userMessage(textPart('question')),
+        assistantMessage(
+          textPart('answer'),
+          imagePart(),
+        ),
+      ],
+      'user-only',
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(textValues(result.messages[1])).toEqual(['answer']);
+    expect(result.messages[1].content).toHaveLength(1);
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
+  });
+
+  it('drops an image-only user message from a marker-less round when images are discarded', () => {
+    const result = sanitize(
+      [
+        userMessage(imagePart()),
+        assistantMessage(textPart('answer')),
+      ],
+      'discard',
+    );
+
+    expect(result.messages).toHaveLength(1);
+    expect(textValues(result.messages[0])).toEqual(['answer']);
+    expect(result.messageOriginIndexes).toEqual([1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
+  });
+
+  it('keeps images in a proven round untouched even for a non-vision target model', () => {
+    const result = sanitize(
+      [
+        userMessage(
+          textPart('question'),
+          imagePart(),
+        ),
+        assistantMessage(
+          textPart('answer'),
+          trustedMarker(),
+        ),
+      ],
+      'discard',
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].content).toHaveLength(2);
+    expect(result.messages[1].content).toHaveLength(2);
+    expect(result.messageOriginIndexes).toEqual([0, 1]);
+    expect(result.sanitizedMessageIndexes).toEqual(new Set());
   });
 });
